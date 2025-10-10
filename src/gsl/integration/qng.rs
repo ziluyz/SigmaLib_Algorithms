@@ -6,7 +6,7 @@ pub struct QngResult {
     pub neval: usize,
 }
 
-pub fn qng<F>(f: &F, a: f64, b: f64, epsabs: f64, epsrel: f64) -> Result<QngResult, String>
+pub fn qng<F>(f: &mut F, a: f64, b: f64, epsabs: f64, epsrel: f64) -> Result<QngResult, String>
 where
     F: FnMut(f64) -> f64,
 {
@@ -15,8 +15,8 @@ where
     let mut neval: usize = 0;
 
     // Приводим замыкание к типу, который понимает trampoline
-    let closure_ptr = f as *const F as *mut std::ffi::c_void;
-
+    let mut closure_trait_obj: &mut dyn FnMut(f64) -> f64 = f;
+    let closure_ptr = &mut closure_trait_obj as *mut _ as *mut std::ffi::c_void;
     let gsl_func = GslFunction {
         function: Some(trampoline),
         params: closure_ptr,
@@ -42,6 +42,9 @@ where
             neval,
         })
     } else {
-        Err(format!("Error in gsl_integration_qng: {}", status))
+        Err(format!(
+            "Error in gsl_integration_qng: {}",
+            super::super::errors::get_error_description(status)
+        ))
     }
 }
