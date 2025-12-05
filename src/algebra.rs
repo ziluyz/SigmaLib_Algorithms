@@ -10,7 +10,7 @@
 /// # Errors
 /// Returns descriptive string
 pub fn find_root(
-    func: &impl Fn(f64) -> f64,
+    func: &impl Fn(f64) -> Result<f64, String>,
     mut x_min: f64,
     mut x_max: f64,
     abs_err: f64,
@@ -21,8 +21,8 @@ pub fn find_root(
             x_min, x_max
         ));
     }
-    let mut f1 = func(x_min);
-    if f1 * func(x_max) > 0.0 {
+    let mut f1 = func(x_min)?;
+    if f1 * func(x_max)? > 0.0 {
         return Err(format!(
             "f(xMin = {}) and f(xMax = {}) have the same sign in find_root()",
             x_min, x_max
@@ -30,7 +30,7 @@ pub fn find_root(
     }
     while x_max - x_min > abs_err {
         let x_mid = (x_min + x_max) / 2.0;
-        let f_mid = func(x_mid);
+        let f_mid = func(x_mid)?;
         if f1 * f_mid < 0.0 {
             x_max = x_mid;
         } else {
@@ -52,7 +52,7 @@ pub fn find_root(
 /// # Errors
 /// Returns descriptive string
 pub fn find_root_sequence(
-    func: &impl Fn(f64) -> f64,
+    func: &impl Fn(f64) -> Result<f64, String>,
     x_start: f64,
     min_root_dist: f64,
     n: usize,

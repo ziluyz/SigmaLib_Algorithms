@@ -40,4 +40,17 @@ unsafe extern "C" {
         result: *mut f64,
         abserr: *mut f64,
     ) -> i32;
+
+    pub fn gsl_integration_romberg_alloc(n: usize) -> *mut std::ffi::c_void;
+    pub fn gsl_integration_romberg_free(workspace: *mut std::ffi::c_void);
+    pub fn gsl_integration_romberg(
+        f: *const GslFunction,
+        a: f64,
+        b: f64,
+        epsabs: f64,
+        epsrel: f64,
+        result: *mut f64,
+        neval: *mut usize,
+        workspace: *mut std::ffi::c_void,
+    ) -> i32;
 }

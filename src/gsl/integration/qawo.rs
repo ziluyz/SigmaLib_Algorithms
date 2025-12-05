@@ -10,6 +10,15 @@ pub enum QawoOscillator {
     Cosine,
 }
 
+impl QawoOscillator {
+    fn interpret(&self) -> i32 {
+        match self {
+            Self::Sine => 1,
+            Self::Cosine => 0,
+        }
+    }
+}
+
 pub struct Qawo {
     workspace: *mut std::ffi::c_void,
     table: *mut std::ffi::c_void,
@@ -36,13 +45,31 @@ impl Qawo {
             self.table = gsl_signatures::gsl_integration_qawo_table_alloc(
                 omega,
                 self.b - self.a,
-                match sine {
-                    QawoOscillator::Sine => 1,
-                    QawoOscillator::Cosine => 0,
-                },
+                sine.interpret(),
                 log2,
             );
             self.intervals = Some(intervals);
+        }
+    }
+
+    pub fn change_parameters(&mut self, omega: f64, a: f64, b: f64, sine: QawoOscillator) {
+        self.a = a;
+        self.b = b;
+        unsafe {
+            gsl_signatures::gsl_integration_qawo_table_set(
+                self.table,
+                omega,
+                b - a,
+                sine.interpret(),
+            );
+        }
+    }
+
+    pub fn change_limits(&mut self, a: f64, b: f64) {
+        self.a = a;
+        self.b = b;
+        unsafe {
+            gsl_signatures::gsl_integration_qawo_table_set_length(self.table, b - a);
         }
     }
 

@@ -1,6 +1,7 @@
 mod gsl_signatures;
 mod qawo;
 mod qng;
+mod romberg;
 
 #[repr(C)]
 struct GslFunction {
@@ -20,4 +21,4 @@ extern "C" fn trampoline(x: f64, params: *mut std::ffi::c_void) -> f64 {
 
 pub use qawo::{Qawo, QawoOscillator, QawoResult};
 pub use qng::{QngResult, qng};
-
+pub use romberg::{Romberg, RombergResult};
