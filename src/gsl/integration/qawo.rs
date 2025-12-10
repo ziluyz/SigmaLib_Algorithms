@@ -73,7 +73,13 @@ impl Qawo {
         }
     }
 
-    pub fn integrate<F>(&self, f: &mut F, epsabs: f64, epsrel: f64) -> Result<QawoResult, String>
+    pub fn integrate<F>(
+        &self,
+        f: &mut F,
+        epsabs: f64,
+        epsrel: f64,
+        ignore_roundoff_error: bool,
+    ) -> Result<QawoResult, String>
     where
         F: FnMut(f64) -> f64,
     {
@@ -105,11 +111,11 @@ impl Qawo {
             )
         };
 
-        if status == 0 {
+        if status == 0 || (status == 18 && ignore_roundoff_error) {
             Ok(QawoResult { result, abserr })
         } else {
             Err(format!(
-                "Error in gsl_integration_qng: {}",
+                "Error in gsl_integration_qawo: {}",
                 super::super::errors::get_error_description(status)
             ))
         }
