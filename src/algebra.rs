@@ -1,3 +1,5 @@
+pub mod argument_root;
+
 /// Finding a root by bisection
 /// # Arguments
 /// * `func` - function of one argument
