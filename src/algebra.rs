@@ -24,6 +24,9 @@ pub fn find_root(
         ));
     }
     let mut f1 = func(x_min)?;
+    if f1 == 0.0 {
+        return Ok(x_min);
+    }
     if f1 * func(x_max)? > 0.0 {
         return Err(format!(
             "f(xMin = {}) and f(xMax = {}) have the same sign in find_root()",
@@ -33,6 +36,10 @@ pub fn find_root(
     while x_max - x_min > abs_err {
         let x_mid = (x_min + x_max) / 2.0;
         let f_mid = func(x_mid)?;
+        if f_mid == 0.0 {
+            // Без этой проверки точное попадание в корень уводило поиск к x_max.
+            return Ok(x_mid);
+        }
         if f1 * f_mid < 0.0 {
             x_max = x_mid;
         } else {
