@@ -38,7 +38,11 @@ impl Qawo {
         }
     }
 
+    /// Allocates the workspace and the table; a repeated call replaces them.
+    /// If GSL fails to allocate (e.g. `intervals` is 0), the integrator stays uninitialized
+    /// and `integrate` returns an error.
     pub fn initialize(&mut self, omega: f64, intervals: usize, sine: QawoOscillator) {
+        self.release();
         unsafe {
             self.workspace = gsl_signatures::gsl_integration_workspace_alloc(intervals);
             let log2 = ((intervals as f64).log(2.0) as usize).max(2);
@@ -48,13 +52,34 @@ impl Qawo {
                 sine.interpret(),
                 log2,
             );
+        }
+        if self.workspace.is_null() || self.table.is_null() {
+            self.release();
+        } else {
             self.intervals = Some(intervals);
         }
+    }
+
+    fn release(&mut self) {
+        unsafe {
+            if !self.workspace.is_null() {
+                gsl_signatures::gsl_integration_workspace_free(self.workspace);
+            }
+            if !self.table.is_null() {
+                gsl_signatures::gsl_integration_qawo_table_free(self.table);
+            }
+        }
+        self.workspace = std::ptr::null_mut();
+        self.table = std::ptr::null_mut();
+        self.intervals = None;
     }
 
     pub fn change_parameters(&mut self, omega: f64, a: f64, b: f64, sine: QawoOscillator) {
         self.a = a;
         self.b = b;
+        if self.table.is_null() {
+            return;
+        }
         unsafe {
             gsl_signatures::gsl_integration_qawo_table_set(
                 self.table,
@@ -68,6 +93,9 @@ impl Qawo {
     pub fn change_limits(&mut self, a: f64, b: f64) {
         self.a = a;
         self.b = b;
+        if self.table.is_null() {
+            return;
+        }
         unsafe {
             gsl_signatures::gsl_integration_qawo_table_set_length(self.table, b - a);
         }
@@ -124,12 +152,6 @@ impl Qawo {
 
 impl Drop for Qawo {
     fn drop(&mut self) {
-        if self.intervals.is_none() {
-            return;
-        }
-        unsafe {
-            gsl_signatures::gsl_integration_workspace_free(self.workspace);
-            gsl_signatures::gsl_integration_qawo_table_free(self.table);
-        }
+        self.release();
     }
 }

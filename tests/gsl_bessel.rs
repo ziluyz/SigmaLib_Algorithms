@@ -1,6 +1,7 @@
 mod common;
 
 use algorithms::algebra::find_root_sequence;
+use algorithms::gsl::errors::turn_off_error_handler;
 use algorithms::gsl::sfunctions::bessel::{djn, jn};
 
 // Эталоны: Abramowitz & Stegun, табл. 9.1 и 9.5; DLMF §10.21.
@@ -60,4 +61,22 @@ fn derivative_zeros_match_tables() {
     let roots = find_root_sequence(&|x| djn(0, x), 0.1, 3.0, 2).unwrap();
     assert_close!(roots[0], 3.831_705_970_207_512, abs = 1e-6);
     assert_close!(roots[1], 7.015_586_669_815_619, abs = 1e-6);
+}
+
+/// Исчезающе малое значение — не ошибка: GSL сообщает underflow, обёртка возвращает ноль.
+#[test]
+fn jn_underflow_is_zero() {
+    turn_off_error_handler();
+    assert_close!(jn(1000, 1e-3).unwrap(), 0.0, abs = 1e-300);
+    assert_close!(djn(1000, 1e-3).unwrap(), 0.0, abs = 1e-300);
+}
+
+/// Нечисловой аргумент — `Err`, а не молча NaN.
+#[test]
+fn jn_reports_gsl_error() {
+    turn_off_error_handler();
+    match jn(1, f64::NAN) {
+        Err(err) => assert!(err.contains("gsl_sf_bessel_Jn"), "{err}"),
+        Ok(v) => panic!("expected an error, got {v}"),
+    }
 }

@@ -42,42 +42,43 @@ impl RectF64 {
 /// Controls / limits.
 #[derive(Debug, Clone)]
 pub struct Limits {
+    /// Maximal depth of the dyadic grid; a rectangle at this depth is reported as is
+    /// (`StopReason::LimitsReached`).
+    /// `max_depth + log2(samples_per_edge0) + max_winding_refine` must not exceed 58.
     pub max_depth: u32,
+    /// Maximal number of processed rectangles; exceeding it is an error.
     pub max_rects: usize,
 
     /// Initial samples per edge (must be power of two).
     pub samples_per_edge0: u32,
     /// Max times to double samples_per_edge for winding computation.
     pub max_winding_refine: usize,
-
-    /// If min |f| on contour is <= abs_tol => treat as boundary root (reported).
-    /// If min |f| on contour is <= contour_suspicion_tol but > abs_tol => error.
-    pub contour_suspicion_tol: f64,
-
-    /// Merge distance for deduplication of roots (in z-plane).
-    pub merge_eps: f64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_depth: 60,
+            max_depth: 40,
             max_rects: 200_000,
             samples_per_edge0: 32,
             max_winding_refine: 8,
-            contour_suspicion_tol: 1e-10,
-            merge_eps: 1e-8,
         }
     }
 }
 
 /// Why we stopped refining a region.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     AbsTolSatisfied,
     RelTolSatisfied,
+    /// `Limits::max_depth` reached.
     LimitsReached,
-    BoundaryHit,
+    /// The rectangle could not be subdivided: for every tried position of the dividing lines
+    /// the winding numbers of the parts were unreliable or inconsistent (zeros too close to
+    /// each other for the given `Limits`, or `f` is dominated by rounding noise, as near a
+    /// multiple zero). The rectangle is reported as is, `multiplicity` is the number of zeros
+    /// inside.
+    SubdivisionFailed,
 }
 
 /// Root report.
@@ -246,47 +247,37 @@ impl DRect {
         Dyadic::new(self.im_max_idx, self.depth)
     }
 
-    /// Split into 4 children at depth+1.
+    /// Split into 4 children by the lines `re = re_min + width * re_eighths / 8` and
+    /// `im = im_min + height * im_eighths / 8` (`4` = the middle).
+    /// The middle split adds one level of depth, any other one adds three.
     /// Order: 0 bottom-left, 1 bottom-right, 2 top-left, 3 top-right.
-    fn split4(&self) -> [DRect; 4] {
-        let d1 = self.depth + 1;
-        let re0 = self.re_min_idx * 2;
-        let re1 = self.re_max_idx * 2;
-        let im0 = self.im_min_idx * 2;
-        let im1 = self.im_max_idx * 2;
+    fn split4(&self, re_eighths: u64, im_eighths: u64) -> [DRect; 4] {
+        let (shift, re_part, im_part) = if re_eighths == 4 && im_eighths == 4 {
+            (1, 1, 1)
+        } else {
+            (3, re_eighths, im_eighths)
+        };
+        let d1 = self.depth + shift;
+        let re0 = self.re_min_idx << shift;
+        let re1 = self.re_max_idx << shift;
+        let im0 = self.im_min_idx << shift;
+        let im1 = self.im_max_idx << shift;
 
-        let re_mid = (re0 + re1) / 2;
-        let im_mid = (im0 + im1) / 2;
+        let re_mid = re0 + self.width_idx() * re_part;
+        let im_mid = im0 + self.height_idx() * im_part;
 
+        let child = |re_min_idx, re_max_idx, im_min_idx, im_max_idx| DRect {
+            depth: d1,
+            re_min_idx,
+            re_max_idx,
+            im_min_idx,
+            im_max_idx,
+        };
         [
-            DRect {
-                depth: d1,
-                re_min_idx: re0,
-                re_max_idx: re_mid,
-                im_min_idx: im0,
-                im_max_idx: im_mid,
-            },
-            DRect {
-                depth: d1,
-                re_min_idx: re_mid,
-                re_max_idx: re1,
-                im_min_idx: im0,
-                im_max_idx: im_mid,
-            },
-            DRect {
-                depth: d1,
-                re_min_idx: re0,
-                re_max_idx: re_mid,
-                im_min_idx: im_mid,
-                im_max_idx: im1,
-            },
-            DRect {
-                depth: d1,
-                re_min_idx: re_mid,
-                re_max_idx: re1,
-                im_min_idx: im_mid,
-                im_max_idx: im1,
-            },
+            child(re0, re_mid, im0, im_mid),
+            child(re_mid, re1, im0, im_mid),
+            child(re0, re_mid, im_mid, im1),
+            child(re_mid, re1, im_mid, im1),
         ]
     }
 }
@@ -322,6 +313,38 @@ impl EvalCache {
 
 /* -------------------- Main API -------------------- */
 
+/// Positions of the dividing lines (in eighths of the rectangle, Re and Im) tried in turn when
+/// a rectangle is subdivided. The middle goes first; the others move the lines away from zeros
+/// that happen to lie on them or too close to them.
+const SPLITS: [(u64, u64); 5] = [(4, 4), (3, 5), (5, 3), (3, 3), (5, 5)];
+
+/// Doublings of the sample count allowed in the first, cheap round over `SPLITS`: moving the
+/// dividing lines away from a zero is cheaper than resolving a contour passing next to it.
+const CHEAP_WINDING_REFINE: usize = 2;
+
+/// Finding zeros of an analytic function in a rectangle of the complex plane by the argument
+/// principle with adaptive subdivision.
+///
+/// The number of zeros inside a rectangle is the winding number of `f` along its boundary.
+/// A rectangle with a nonzero winding number is divided into four parts until one of the stop
+/// criteria is met; then its center is reported as a zero.
+/// # Arguments
+/// * `f` - function, analytic in `rect` (a pole is counted as a zero of negative multiplicity)
+/// * `rect` - search area; no zero may lie on its boundary
+/// * `abs_tol` - a rectangle with a single zero is accepted when `|f(center)| <= abs_tol`
+///   (0 turns this criterion off)
+/// * `rel_tol` - a rectangle is accepted when its diagonal is `<= rel_tol`
+/// * `stop_after_first` - return as soon as one zero is found
+/// * `limits` - limits of the search
+/// # Result
+/// Returns `Ok(roots)`: one `Root` per located zero or cluster of zeros not separated at the
+/// requested accuracy; `Root::multiplicity` is the number of zeros in `Root::rect`, counted with
+/// multiplicity, `Root::stop_reason` tells why the rectangle was accepted. The sum of
+/// multiplicities equals the number of zeros in `rect`.
+/// # Errors
+/// Returns descriptive string if arguments are invalid, if the winding number along the boundary
+/// of `rect` cannot be computed reliably (a zero on the boundary or too close to it — move the
+/// boundary), or if `limits.max_rects` is exceeded
 pub fn find_zeros_by_argument<F>(
     f: F,
     rect: RectF64,
@@ -342,12 +365,15 @@ where
     if limits.samples_per_edge0 < 2 || !limits.samples_per_edge0.is_power_of_two() {
         return Err("limits.samples_per_edge0 must be a power of two and >= 2".into());
     }
-    println!(
-        "susp_tol: {}, abs_tol: {}",
-        limits.contour_suspicion_tol, abs_tol
-    );
-    if !(limits.contour_suspicion_tol.is_finite() && limits.contour_suspicion_tol >= abs_tol) {
-        return Err("limits.contour_suspicion_tol must be finite and >= abs_tol".into());
+    // Индексы точек на сетке — u64: глубина вместе с дроблением контура должна в него помещаться
+    // (с запасом на сдвинутое деление, которое добавляет три уровня глубины сразу).
+    let max_bits = limits.max_depth as u64
+        + limits.samples_per_edge0.trailing_zeros() as u64
+        + limits.max_winding_refine as u64;
+    if max_bits > 58 {
+        return Err(
+            "limits: max_depth + log2(samples_per_edge0) + max_winding_refine must be <= 58".into(),
+        );
     }
 
     let grid = GlobalGrid::from_rect(&rect);
@@ -358,20 +384,25 @@ where
     // Start from integer root rectangle.
     let r0 = DRect::root();
 
-    // Initial winding number (also may report boundary roots).
-    let n0 = match winding_number_rect(&f, &r0, abs_tol, &limits, &grid, &mut cache, &mut roots)? {
-        WindingResult::Wn(n) => n,
-        WindingResult::BoundaryRoot => {
-            if stop_after_first && !roots.is_empty() {
-                dedup_roots(&mut roots, limits.merge_eps);
-                return Ok(roots);
-            }
-            1
+    let n0 = match winding_number_rect(
+        &f,
+        &r0,
+        limits.max_winding_refine,
+        &limits,
+        &grid,
+        &mut cache,
+    ) {
+        Some(n) => n,
+        None => {
+            return Err(
+                "Cannot compute the winding number on the boundary of the rectangle: a zero \
+                 (or a singularity) lies on the boundary or too close to it; move the boundary"
+                    .into(),
+            );
         }
     };
 
     if n0 == 0 {
-        dedup_roots(&mut roots, limits.merge_eps);
         return Ok(roots);
     }
 
@@ -387,24 +418,21 @@ where
     let mut processed = 0usize;
 
     while let Some(c) = queue.pop_front() {
-        println!(
-            "cand n: {}, cand DRect: {}, {}, {}, {}, {}",
-            c.n, c.r.depth, c.r.re_min_idx, c.r.re_max_idx, c.r.im_min_idx, c.r.im_max_idx
-        );
         processed += 1;
         if processed > limits.max_rects {
             return Err("Rectangle processing budget exceeded".into());
         }
 
-        // Stop criteria: OR (less strict triggers first).
         let center_key = c.r.center_key();
         let center_z = grid.point(center_key);
-        println!("Center: {center_z}");
         let f_center = cache.get_or_eval(center_key, center_z, &f); // cache center too
         let abs_f = f_center.norm();
         let diag = c.r.diag(&grid);
 
-        let stop_reason = if abs_f <= abs_tol {
+        // Stop criteria: OR (less strict triggers first).
+        // Малое |f| в центре говорит о найденном нуле, только если ноль в прямоугольнике один:
+        // иначе остальные были бы потеряны.
+        let mut stop_reason = if c.n.abs() == 1 && abs_f <= abs_tol {
             Some(StopReason::AbsTolSatisfied)
         } else if diag <= rel_tol {
             Some(StopReason::RelTolSatisfied)
@@ -414,13 +442,24 @@ where
             None
         };
 
+        if stop_reason.is_none() {
+            match subdivide(&f, &c.r, c.n, &limits, &grid, &mut cache) {
+                Some(children) => {
+                    for (r, n) in children {
+                        queue.push_back(Cand { r, n });
+                    }
+                    continue;
+                }
+                None => stop_reason = Some(StopReason::SubdivisionFailed),
+            }
+        }
+
         if let Some(reason) = stop_reason {
-            let rect_f = grid.rect_f64(&c.r);
             roots.push(Root {
                 z: center_z,
                 fz: f_center,
                 abs_f,
-                rect: rect_f,
+                rect: grid.rect_f64(&c.r),
                 rect_diag: diag,
                 multiplicity: c.n,
                 stop_reason: reason,
@@ -428,239 +467,134 @@ where
             });
 
             if stop_after_first {
-                dedup_roots(&mut roots, limits.merge_eps);
                 return Ok(roots);
-            }
-            continue;
-        }
-
-        // Subdivide.
-        for child in c.r.split4() {
-            println!(
-                "child: {}, {} {} {} {}",
-                child.depth, child.re_min_idx, child.re_max_idx, child.im_min_idx, child.im_max_idx
-            );
-            let mut boundary_hits: Vec<Root> = Vec::new();
-            let wn = match winding_number_rect(
-                &f,
-                &child,
-                abs_tol,
-                &limits,
-                &grid,
-                &mut cache,
-                &mut boundary_hits,
-            )? {
-                WindingResult::Wn(n) => n,
-                WindingResult::BoundaryRoot => {
-                    roots.extend(boundary_hits);
-                    if stop_after_first && !roots.is_empty() {
-                        dedup_roots(&mut roots, limits.merge_eps);
-                        return Ok(roots);
-                    }
-                    1
-                }
-            };
-
-            // if !boundary_hits.is_empty() {
-            //     roots.extend(boundary_hits);
-            //     if stop_after_first && !roots.is_empty() {
-            //         dedup_roots(&mut roots, limits.merge_eps);
-            //         return Ok(roots);
-            //     }
-            // }
-
-            if wn != 0 {
-                queue.push_back(Cand { r: child, n: wn });
             }
         }
     }
 
-    dedup_roots(&mut roots, limits.merge_eps);
     Ok(roots)
+}
+
+/// Divides `r` (winding number `n`) into four parts and returns those with a nonzero winding
+/// number. A division is accepted if the winding numbers of all four parts are reliable and sum
+/// up to `n`. Returns `None` if no position of the dividing lines from `SPLITS` is accepted.
+fn subdivide<F>(
+    f: &F,
+    r: &DRect,
+    n: i64,
+    limits: &Limits,
+    grid: &GlobalGrid,
+    cache: &mut EvalCache,
+) -> Option<Vec<(DRect, i64)>>
+where
+    F: Fn(C64) -> C64,
+{
+    let cheap = limits.max_winding_refine.min(CHEAP_WINDING_REFINE);
+    let budgets = if cheap < limits.max_winding_refine {
+        vec![cheap, limits.max_winding_refine]
+    } else {
+        vec![cheap]
+    };
+
+    for max_refine in budgets {
+        'split: for (re_eighths, im_eighths) in SPLITS {
+            let mut children = Vec::with_capacity(4);
+            let mut total = 0;
+            for child in r.split4(re_eighths, im_eighths) {
+                let Some(wn) = winding_number_rect(f, &child, max_refine, limits, grid, cache)
+                else {
+                    continue 'split;
+                };
+                total += wn;
+                if wn != 0 {
+                    children.push((child, wn));
+                }
+            }
+            if total == n {
+                return Some(children);
+            }
+        }
+    }
+    None
 }
 
 /* -------------------- Winding number on integer rectangles -------------------- */
 
-enum WindingResult {
-    Wn(i64),
-    BoundaryRoot,
-}
-
+/// Winding number of `f` along the boundary of `r`, or `None` if it cannot be computed reliably
+/// with at most `max_refine` doublings of the number of samples.
 fn winding_number_rect<F>(
     f: &F,
     r: &DRect,
-    abs_tol: f64,
+    max_refine: usize,
     limits: &Limits,
     grid: &GlobalGrid,
     cache: &mut EvalCache,
-    roots_out: &mut Vec<Root>,
-) -> Result<WindingResult, String>
+) -> Option<i64>
 where
     F: Fn(C64) -> C64,
 {
     let mut samples = limits.samples_per_edge0;
-    let mut last: Option<i64> = None;
 
-    for _ in 0..=limits.max_winding_refine {
-        match winding_pass(
-            f,
-            r,
-            samples,
-            abs_tol,
-            limits.contour_suspicion_tol,
-            grid,
-            cache,
-        )? {
-            WindingPass::BoundaryHits(hits) => {
-                // Report all hits as BoundaryHit roots.
-                let rect_f = grid.rect_f64(r);
-                let diag = r.diag(grid);
-                for (key, fz) in hits {
-                    let z = grid.point(key);
-                    roots_out.push(Root {
-                        z,
-                        fz,
-                        abs_f: fz.norm(),
-                        rect: rect_f,
-                        rect_diag: diag,
-                        multiplicity: 1,
-                        stop_reason: StopReason::BoundaryHit,
-                        depth: r.depth,
-                    });
-                }
-                return Ok(WindingResult::BoundaryRoot);
-            }
-            WindingPass::Unstable { min_abs_f } => {
-                return Err(format!(
-                    "Contour too close to a zero: min |f| on boundary = {min_abs_f:.3e} \
-                     (abs_tol={abs_tol:.3e}, suspicion_tol={:.3e})",
-                    limits.contour_suspicion_tol
-                ));
-            }
-            WindingPass::Ok { n, stable } => {
-                if stable {
-                    if let Some(prev) = last {
-                        if prev == n {
-                            return Ok(WindingResult::Wn(n));
-                        }
-                    } else {
-                        return Ok(WindingResult::Wn(n));
-                    }
-                }
-                last = Some(n);
-            }
+    for _ in 0..=max_refine {
+        match winding_pass(f, r, samples, grid, cache) {
+            WindingPass::Smooth(n) => return Some(n),
+            WindingPass::Rough => {}
+            // Точки более частой выборки включают текущие: дробить бесполезно.
+            WindingPass::Singular => return None,
         }
-        samples = samples.saturating_mul(2);
+        samples *= 2;
     }
 
-    Err("Failed to compute stable winding number on rectangle boundary".into())
+    None
 }
 
 enum WindingPass {
-    Ok { n: i64, stable: bool },
-    BoundaryHits(Vec<(PointKey, C64)>),
-    Unstable { min_abs_f: f64 },
+    /// `log f` changes slowly between adjacent samples: the winding number is reliable.
+    Smooth(i64),
+    /// Sampling is too coarse.
+    Rough,
+    /// `f` is zero or not finite at a sample point.
+    Singular,
 }
 
-fn winding_stable(w: &[C64]) -> bool {
-    // Conservative stability check:
-    // - if any step has phase jump close to pi, we likely undersampled
-    // - if any value is non-finite, unstable
-    //
-    // Threshold chosen to be strict enough to force refinement when needed.
-    const PHASE_JUMP_MAX: f64 = 2.4; // < pi, stricter than previous 2.8
-
-    if w.len() < 4 {
-        return false;
-    }
-
-    for &val in w {
-        if !val.re.is_finite() || !val.im.is_finite() {
-            return false;
-        }
-    }
-
-    for i in 0..w.len() {
-        let a = w[i];
-        let b = w[(i + 1) % w.len()];
-        let prod = a.conj() * b;
-        let delta = prod.im.atan2(prod.re);
-        if delta.abs() > PHASE_JUMP_MAX {
-            return false;
-        }
-    }
-    true
-}
+/// Maximal change of `arg f` and of `ln |f|` between adjacent samples of a reliable contour.
+///
+/// Обе величины — части приращения `log f`. Одного контроля фазы мало: рядом с m-кратным нулём,
+/// лежащим почти на контуре, фаза между соседними точками меняется почти на `m·π`, и при чётном
+/// `m` это неотличимо от малого изменения. Модуль при этом меняется между соседними точками не
+/// менее чем в `3^m` раз, что и ловит вторая проверка.
+const LOG_STEP_MAX: f64 = 1.0;
 
 fn winding_pass<F>(
     f: &F,
     r: &DRect,
     samples_per_edge: u32,
-    abs_tol: f64,
-    suspicion_tol: f64,
     grid: &GlobalGrid,
     cache: &mut EvalCache,
-) -> Result<WindingPass, String>
+) -> WindingPass
 where
     F: Fn(C64) -> C64,
 {
-    if samples_per_edge < 2 || !samples_per_edge.is_power_of_two() {
-        return Err("Internal error: samples_per_edge must be power of two".into());
-    }
-
-    // Unique contour sampling:
-    // - bottom: k = 0..n-1
-    // - right : k = 0..n-1, but skip k=0 (bottom-right corner)
-    // - top   : k = 0..n-1, but skip k=0 (top-right corner)
-    // - left  : k = 0..n-1, but skip k=0 (top-left corner)
+    // Unique contour sampling: n points per edge, the end corner of an edge belongs to the next
+    // one.
     let n = samples_per_edge;
 
-    let mut keys: Vec<PointKey> = Vec::with_capacity((4 * n - 3) as usize);
-
-    // bottom
-    for k in 0..n {
-        keys.push(boundary_key(r, 0, k, n));
-    }
-    // right (skip first corner)
-    for k in 1..n {
-        keys.push(boundary_key(r, 1, k, n));
-    }
-    // top (skip first corner)
-    for k in 1..n {
-        keys.push(boundary_key(r, 2, k, n));
-    }
-    // left (skip first corner)
-    for k in 1..n {
-        keys.push(boundary_key(r, 3, k, n));
-    }
-
-    // Evaluate f on contour with caching.
-    let mut w: Vec<C64> = Vec::with_capacity(keys.len());
-    let mut min_abs_f = f64::INFINITY;
-    let mut hits: Vec<(PointKey, C64)> = Vec::new();
-
-    for &key in &keys {
-        let z = grid.point(key);
-        let fz = cache.get_or_eval(key, z, f);
-        let af = fz.norm();
-        min_abs_f = min_abs_f.min(af);
-        if af <= abs_tol {
-            hits.push((key, fz));
+    let mut w: Vec<C64> = Vec::with_capacity(4 * n as usize);
+    for edge in 0..4 {
+        for k in 0..n {
+            let key = boundary_key(r, edge, k, n);
+            let fz = cache.get_or_eval(key, grid.point(key), f);
+            if !fz.re.is_finite() || !fz.im.is_finite() || (fz.re == 0.0 && fz.im == 0.0) {
+                return WindingPass::Singular;
+            }
+            w.push(fz);
         }
-        w.push(fz);
-    }
-
-    if !hits.is_empty() {
-        return Ok(WindingPass::BoundaryHits(hits));
-    }
-    if min_abs_f <= suspicion_tol {
-        return Ok(WindingPass::Unstable { min_abs_f });
     }
 
     // Winding number via phase increments.
     let m = w.len();
     let mut total = 0.0f64;
-    let mut stable = true;
+    let mut smooth = true;
 
     for i in 0..m {
         let a = w[i];
@@ -668,13 +602,18 @@ where
         let prod = a.conj() * b;
         let delta = prod.im.atan2(prod.re);
         total += delta;
+        let log_ratio = (b.norm() / a.norm()).ln();
+        // Сравнение в такой форме отбраковывает и NaN.
+        if !(delta.abs() <= LOG_STEP_MAX && log_ratio.abs() <= LOG_STEP_MAX) {
+            smooth = false;
+        }
     }
 
-    // Stability check moved to a separate function (see пункт 2).
-    stable = stable && winding_stable(&w);
-
-    let wn = (total / (2.0 * std::f64::consts::PI)).round() as i64;
-    Ok(WindingPass::Ok { n: wn, stable })
+    if smooth {
+        WindingPass::Smooth((total / (2.0 * std::f64::consts::PI)).round() as i64)
+    } else {
+        WindingPass::Rough
+    }
 }
 
 /// Boundary point key for integer rectangle `r` at depth `d`.
@@ -700,31 +639,18 @@ fn boundary_key(r: &DRect, edge: u8, k: u32, samples_per_edge: u32) -> PointKey 
     let im0 = r.im_min_idx << s;
     let im1 = r.im_max_idx << s;
 
-    // k is in [0..samples_per_edge-1]; we sample corners multiple times; ok.
-    // Parameter t = k / samples_per_edge.
-    // For forward direction: idx = start + (end-start)*k/samples_per_edge.
-    // Since denom is 2^s, this becomes integer arithmetic:
-    // idx = start + (end-start)*k / 2^s
+    // Parameter t = k / samples_per_edge, k in [0..samples_per_edge-1].
+    // idx = start + (end-start)*k/samples_per_edge; the bounds are already multiplied by
+    // samples_per_edge, so the step is the width (height) of the rectangle in its own indices.
     let kk = k as u64;
-    let denom = samples_per_edge as u64;
+    let re_step = r.width_idx();
+    let im_step = r.height_idx();
 
     let (re_nom, im_nom) = match edge {
-        0 => {
-            let re_nom = re0 + ((re1 - re0) * kk) / denom;
-            (re_nom, im0)
-        }
-        1 => {
-            let im_nom = im0 + ((im1 - im0) * kk) / denom;
-            (re1, im_nom)
-        }
-        2 => {
-            let re_nom = re1 - ((re1 - re0) * kk) / denom;
-            (re_nom, im1)
-        }
-        3 => {
-            let im_nom = im1 - ((im1 - im0) * kk) / denom;
-            (re0, im_nom)
-        }
+        0 => (re0 + re_step * kk, im0),
+        1 => (re1, im0 + im_step * kk),
+        2 => (re1 - re_step * kk, im1),
+        3 => (re0, im1 - im_step * kk),
         _ => unreachable!(),
     };
 
@@ -732,29 +658,4 @@ fn boundary_key(r: &DRect, edge: u8, k: u32, samples_per_edge: u32) -> PointKey 
         re: Dyadic::new(re_nom, pow_var),
         im: Dyadic::new(im_nom, pow_var),
     }
-}
-
-/* -------------------- Dedup -------------------- */
-
-fn dedup_roots(roots: &mut Vec<Root>, eps: f64) {
-    if roots.len() <= 1 {
-        return;
-    }
-    // Prefer smaller |f|.
-    roots.sort_by(|a, b| {
-        a.abs_f
-            .partial_cmp(&b.abs_f)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut kept: Vec<Root> = Vec::with_capacity(roots.len());
-    'outer: for r in roots.drain(..) {
-        for k in &kept {
-            if (r.z - k.z).norm() <= eps {
-                continue 'outer;
-            }
-        }
-        kept.push(r);
-    }
-    *roots = kept;
 }

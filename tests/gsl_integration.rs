@@ -30,7 +30,9 @@ fn qng_polynomial_and_sine() {
 fn qng_reports_failure_as_err() {
     turn_off_error_handler();
     // Неинтегрируемая особенность: qng обязан вернуть Err, а не abort().
-    let err = qng(&mut |x: f64| 1.0 / x, 0.0, 1.0, 1e-12, 1e-12).err().unwrap();
+    let err = qng(&mut |x: f64| 1.0 / x, 0.0, 1.0, 1e-12, 1e-12)
+        .err()
+        .unwrap();
     assert!(err.contains("gsl_integration_qng"), "{err}");
 }
 
@@ -65,19 +67,26 @@ fn romberg_smooth_integrands() {
     turn_off_error_handler();
     let mut romberg = Romberg::new(0.0, PI);
     romberg.initialize(20);
-    let r = romberg.integrate(&mut |x: f64| x.sin(), 1e-12, 1e-12).unwrap();
+    let r = romberg
+        .integrate(&mut |x: f64| x.sin(), 1e-12, 1e-12)
+        .unwrap();
     assert_close!(r.result, 2.0, abs = 1e-10);
 
     let mut romberg = Romberg::new(-1.0, 2.0);
     romberg.initialize(20);
-    let r = romberg.integrate(&mut |x: f64| x.exp(), 1e-12, 1e-12).unwrap();
+    let r = romberg
+        .integrate(&mut |x: f64| x.exp(), 1e-12, 1e-12)
+        .unwrap();
     assert_close!(r.result, 2f64.exp() - (-1f64).exp(), abs = 1e-10);
 }
 
 #[test]
 fn qawo_requires_initialize() {
     let qawo = Qawo::new(0.0, 1.0);
-    assert!(qawo.integrate(&mut |x: f64| x, 1e-10, 1e-10, false).is_err());
+    assert!(
+        qawo.integrate(&mut |x: f64| x, 1e-10, 1e-10, false)
+            .is_err()
+    );
 }
 
 #[test]
@@ -121,4 +130,55 @@ fn qawo_change_parameters_and_limits() {
 fn error_description_is_readable() {
     assert_eq!(get_error_description(0), "success");
     assert!(!get_error_description(18).is_empty());
+}
+
+/// Повторный `initialize` заменяет ресурсы GSL (прежние освобождаются), интегратор работает.
+#[test]
+fn reinitialize_replaces_resources() {
+    turn_off_error_handler();
+    let mut romberg = Romberg::new(0.0, PI);
+    for iterations in [5, 20, 10, 20] {
+        romberg.initialize(iterations);
+    }
+    let r = romberg
+        .integrate(&mut |x: f64| x.sin(), 1e-12, 1e-12)
+        .unwrap();
+    assert_close!(r.result, 2.0, abs = 1e-10);
+
+    let mut qawo = Qawo::new(0.0, 1.0);
+    for _ in 0..4 {
+        qawo.initialize(3.0, 500, QawoOscillator::Cosine);
+    }
+    qawo.initialize(10.0, 1000, QawoOscillator::Sine);
+    let r = qawo.integrate(&mut |x: f64| x, 1e-12, 1e-10, true).unwrap();
+    assert_close!(r.result, x_sin(10.0), abs = 1e-10);
+}
+
+/// Неудачное выделение ресурсов (GSL отвергает нулевой размер) не приводит к обращению по
+/// нулевому указателю: интегратор остаётся неинициализированным.
+#[test]
+fn failed_allocation_leaves_integrator_uninitialized() {
+    turn_off_error_handler();
+    let mut romberg = Romberg::new(0.0, 1.0);
+    romberg.initialize(0);
+    assert!(romberg.integrate(&mut |x: f64| x, 1e-10, 1e-10).is_err());
+
+    let mut qawo = Qawo::new(0.0, 1.0);
+    qawo.initialize(1.0, 0, QawoOscillator::Sine);
+    assert!(
+        qawo.integrate(&mut |x: f64| x, 1e-10, 1e-10, false)
+            .is_err()
+    );
+}
+
+/// Смена параметров до `initialize` безопасна.
+#[test]
+fn qawo_change_before_initialize_is_safe() {
+    let mut qawo = Qawo::new(0.0, 1.0);
+    qawo.change_parameters(2.0, 0.0, 2.0, QawoOscillator::Sine);
+    qawo.change_limits(0.0, 3.0);
+    assert!(
+        qawo.integrate(&mut |x: f64| x, 1e-10, 1e-10, false)
+            .is_err()
+    );
 }

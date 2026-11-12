@@ -22,11 +22,24 @@ impl Romberg {
         }
     }
 
+    /// Allocates the workspace for `iterations` iterations; a repeated call replaces it.
+    /// If GSL fails to allocate (e.g. `iterations` is 0), the integrator stays uninitialized
+    /// and `integrate` returns an error.
     pub fn initialize(&mut self, iterations: usize) {
-        unsafe {
-            self.workspace = gsl_signatures::gsl_integration_romberg_alloc(iterations);
+        self.release();
+        let workspace = unsafe { gsl_signatures::gsl_integration_romberg_alloc(iterations) };
+        if !workspace.is_null() {
+            self.workspace = workspace;
             self.iterations = Some(iterations);
         }
+    }
+
+    fn release(&mut self) {
+        if !self.workspace.is_null() {
+            unsafe { gsl_signatures::gsl_integration_romberg_free(self.workspace) };
+            self.workspace = std::ptr::null_mut();
+        }
+        self.iterations = None;
     }
 
     pub fn integrate<F>(&self, f: &mut F, epsabs: f64, epsrel: f64) -> Result<RombergResult, String>
@@ -73,11 +86,6 @@ impl Romberg {
 
 impl Drop for Romberg {
     fn drop(&mut self) {
-        if self.iterations.is_none() {
-            return;
-        }
-        unsafe {
-            gsl_signatures::gsl_integration_romberg_free(self.workspace);
-        }
+        self.release();
     }
 }
