@@ -1,5 +1,7 @@
 pub mod argument_root;
 
+use num_complex::Complex64;
+
 /// Finding a root by bisection
 /// # Arguments
 /// * `func` - function of one argument
@@ -189,4 +191,73 @@ fn scan_roots(
         break;
     }
     Ok(res)
+}
+
+/// Finding a root of an analytic function of a complex argument by linear-fractional
+/// interpolation
+///
+/// The next point is the zero of the linear-fractional function `(z - a) / (b z + c)` passing
+/// through the last three points (the third starting point is a secant step). Unlike the
+/// secant method, the model is exact for a function with a simple zero and a simple pole next to
+/// it - a resonance. Fast (order 1.84) near a simple root, but only locally convergent: the
+/// starting points have to be close to the root (e.g. inside a rectangle found by
+/// [`argument_root::find_zeros_by_argument`]), and the caller has to check that the returned
+/// root is the expected one.
+/// # Arguments
+/// * `func` - analytic function
+/// * `z0`, `z1` - two different starting points
+/// * `abs_tol` - a point is accepted as the root when `|func(z)| <= abs_tol`
+/// * `max_evaluations` - maximal number of evaluations of `func`
+/// # Result
+/// Returns `Ok(Some((z, func(z))))` with `|func(z)| <= abs_tol`, or `Ok(None)` if the
+/// iterations did not converge: the limit of evaluations is reached, the next point cannot be
+/// built (equal values of the function), or a value is not finite
+/// # Errors
+/// Returns descriptive string if the arguments are invalid, or the error of `func`
+pub fn find_root_rational(
+    func: &impl Fn(Complex64) -> Result<Complex64, String>,
+    z0: Complex64,
+    z1: Complex64,
+    abs_tol: f64,
+    max_evaluations: usize,
+) -> Result<Option<(Complex64, Complex64)>, String> {
+    if !(abs_tol.is_finite() && abs_tol >= 0.0) {
+        return Err(format!("abs_tol = {abs_tol} must be finite and >= 0 in find_root_rational()"));
+    }
+    if z0 == z1 || !z0.is_finite() || !z1.is_finite() {
+        return Err(format!(
+            "Starting points {z0} and {z1} must be finite and different in find_root_rational()"
+        ));
+    }
+    // Последние точки, от старой к новой: (z, f(z)).
+    let mut points: Vec<(Complex64, Complex64)> = Vec::with_capacity(3);
+    let mut z = z0;
+    for evaluation in 0..max_evaluations {
+        let f = func(z)?;
+        if !f.is_finite() {
+            return Ok(None);
+        }
+        if f.norm() <= abs_tol {
+            return Ok(Some((z, f)));
+        }
+        if points.len() == 3 {
+            points.remove(0);
+        }
+        points.push((z, f));
+        let next = match points[..] {
+            [_] if evaluation == 0 => z1,
+            [(za, fa), (zb, fb)] => zb - fb * (zb - za) / (fb - fa),
+            [(za, fa), (zb, fb), (zc, fc)] => {
+                // Двойное отношение сохраняется: (z, za; zb, zc) = (0, fa; fb, fc).
+                let t = fb * (fa - fc) / (fc * (fa - fb)) * (za - zb) / (za - zc);
+                (zb - t * zc) / (1.0 - t)
+            }
+            _ => return Ok(None),
+        };
+        if !next.is_finite() || points.iter().any(|(known, _)| *known == next) {
+            return Ok(None);
+        }
+        z = next;
+    }
+    Ok(None)
 }
