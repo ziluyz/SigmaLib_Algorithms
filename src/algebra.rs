@@ -1,4 +1,7 @@
 pub mod argument_root;
+mod newton2d;
+
+pub use newton2d::{Newton2dOptions, Newton2dRoot, newton_2d};
 
 use num_complex::Complex64;
 

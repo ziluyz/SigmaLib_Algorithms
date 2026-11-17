@@ -1,5 +1,6 @@
 pub mod algebra;
 pub mod bvp;
+pub mod continuation;
 pub mod gsl;
 pub mod linalg;
 pub mod mesh;

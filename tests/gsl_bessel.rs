@@ -80,3 +80,43 @@ fn jn_reports_gsl_error() {
         Ok(v) => panic!("expected an error, got {v}"),
     }
 }
+
+#[test]
+fn series_matches_gsl() {
+    use algorithms::gsl::sfunctions::bessel::{SERIES_LIMIT, djn, jn, jn_djn};
+    algorithms::gsl::errors::turn_off_error_handler();
+    for n in -6..=6 {
+        for i in -40..=40 {
+            let x = SERIES_LIMIT * f64::from(i) / 40.0;
+            let (j, dj) = jn_djn(n, x).unwrap();
+            assert_close!(j, jn(n, x).unwrap(), abs = 1e-16, rel = 1e-14);
+            // djn у GSL — разность J_{n−1} и J_{n+1}: абсолютная ошибка около 1e-16.
+            assert_close!(dj, djn(n, x).unwrap(), abs = 1e-15, rel = 1e-14);
+        }
+    }
+    // За пределом ряда — значения GSL.
+    let (j, dj) = jn_djn(3, 7.5).unwrap();
+    assert_eq!(j, jn(3, 7.5).unwrap());
+    assert_eq!(dj, djn(3, 7.5).unwrap());
+    // Табличные значения (Abramowitz & Stegun, табл. 9.1): J_0(1), J_1(1); J_1'(0) = 1/2.
+    assert_close!(jn_djn(0, 1.0).unwrap().0, 0.765_197_686_557_966_6, rel = 1e-15);
+    assert_close!(jn_djn(0, 1.0).unwrap().1, -0.440_050_585_744_933_5, rel = 2e-15);
+    assert_eq!(jn_djn(1, 0.0).unwrap(), (0.0, 0.5));
+    assert!(jn_djn(1, f64::NAN).is_err());
+}
+
+#[test]
+fn bessel_over_power() {
+    use algorithms::gsl::sfunctions::bessel::{jn, jn_over_power};
+    algorithms::gsl::errors::turn_off_error_handler();
+    for m in 0..=5u32 {
+        // В нуле — 1/(2^m m!).
+        let factorial: f64 = (1..=m).map(f64::from).product();
+        assert_close!(jn_over_power(m, 0.0).unwrap(), 1.0 / (2f64.powi(m as i32) * factorial), rel = 1e-15);
+        for x in [-3.0, -1.0, 1e-3, 0.5, 1.9, 2.1, 4.0] {
+            let expected = jn(m as i32, x).unwrap() / x.powi(m as i32);
+            assert_close!(jn_over_power(m, x).unwrap(), expected, abs = 1e-16, rel = 1e-13);
+        }
+    }
+    assert!(jn_over_power(1, f64::INFINITY).is_err());
+}

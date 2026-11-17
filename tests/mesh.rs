@@ -69,3 +69,61 @@ fn invalid_input_is_error() {
     assert!(refine(&[1.0, 1.0], &[&[1.0, 2.0]], 0.1).is_err());
     assert!(refine(&[0.0, 1.0], &[&[1.0, 2.0]], 1e-12).is_err());
 }
+
+#[test]
+fn limits_inside_and_at_jump() {
+    use algorithms::mesh::limits;
+    let xs = [0.0, 1.0, 1.0, 2.0];
+    let ys = [0.0, 1.0, 3.0, 5.0];
+    assert_eq!(limits(&xs, &ys, 0.5).unwrap(), (0.5, 0.5));
+    assert_eq!(limits(&xs, &ys, 1.0).unwrap(), (1.0, 3.0));
+    assert_eq!(limits(&xs, &ys, 0.0).unwrap(), (0.0, 0.0));
+    assert_eq!(limits(&xs, &ys, 2.0).unwrap(), (5.0, 5.0));
+    assert_close!(limits(&xs, &ys, 1.5).unwrap().0, 4.0, abs = 1e-15);
+    assert!(limits(&xs, &ys, 2.5).is_err());
+    assert!(limits(&xs, &ys[..2], 0.5).is_err());
+}
+
+/// Профили из input.ixml проекта ssmgnfs: геометрия и магнитное поле на разных сетках.
+#[test]
+fn union_of_two_profiles() {
+    use algorithms::mesh::refine_union;
+    let zg = [-0.1, 0.0, 1.2, 1.4, 2.0];
+    let rg = [0.145, 0.15, 0.15, 0.16, 0.16];
+    let zb = [-10.0, 1.5, 1.7, 40.0];
+    let wb = [1.0, 1.0, 0.2, 0.2];
+    let mesh = refine_union(&[(&zg, &rg), (&zb, &wb)], -0.1, 2.0, 0.01).unwrap();
+    assert_eq!(mesh.len(), 211);
+    assert!(mesh.intervals.iter().all(|&i| i == Interval::Smooth));
+    for (i, &z) in mesh.x.iter().enumerate() {
+        assert_close!(z, -0.1 + 0.01 * i as f64, abs = 1e-12);
+    }
+    // Узлы обоих профилей сохранены точно.
+    for knot in [0.0, 1.2, 1.4, 1.5, 1.7] {
+        assert!(mesh.x.contains(&knot), "{knot}");
+    }
+    let at = |z: f64| mesh.x.iter().position(|&x| x == z).unwrap();
+    assert_eq!(mesh.y[0][at(1.4)], 0.16);
+    assert_eq!(mesh.y[1][at(1.5)], 1.0);
+    assert_close!(mesh.y[1][at(1.7) - 10], 0.6, abs = 1e-12);
+    assert_close!(mesh.y[0][at(1.2) + 10], 0.155, abs = 1e-12);
+}
+
+#[test]
+fn union_keeps_jumps_and_checks_coverage() {
+    use algorithms::mesh::refine_union;
+    let mesh = refine_union(
+        &[(&[0.0, 1.0, 1.0, 2.0], &[1.0, 1.0, 2.0, 2.0]), (&[0.0, 2.0], &[0.0, 4.0])],
+        0.0,
+        2.0,
+        0.5,
+    )
+    .unwrap();
+    assert_eq!(mesh.x, vec![0.0, 0.5, 1.0, 1.0, 1.5, 2.0]);
+    assert_eq!(mesh.y[0], vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+    assert_eq!(mesh.y[1], vec![0.0, 1.0, 2.0, 2.0, 3.0, 4.0]);
+    assert_eq!(mesh.intervals[2], Interval::Jump);
+    assert!(refine_union(&[(&[0.5, 2.0], &[0.0, 1.0])], 0.0, 2.0, 0.5).is_err());
+    assert!(refine_union(&[], 0.0, 2.0, 0.5).is_err());
+    assert!(refine_union(&[(&[0.0, 2.0], &[0.0, 1.0])], 1.0, 1.0, 0.5).is_err());
+}
